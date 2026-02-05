@@ -1,0 +1,536 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>Dynamic QR Manager</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+
+    <link
+      href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/css/bootstrap.min.css"
+      rel="stylesheet"
+    />
+    <script src="https://cdn.jsdelivr.net/npm/qrcode@1.5.4/build/qrcode.min.js"></script>
+
+    <style>
+      body {
+        background: #f4f6fb;
+      }
+      .mono {
+        font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas,
+          "Liberation Mono", "Courier New", monospace;
+        font-size: 12px;
+      }
+      .sparkline {
+        display: flex;
+        gap: 2px;
+        align-items: flex-end;
+        height: 22px;
+      }
+      .sparkline span {
+        width: 4px;
+        background: #0d6efd;
+        border-radius: 2px;
+      }
+      @media (max-width: 768px) {
+        .table-responsive-stack thead {
+          display: none;
+        }
+        .table-responsive-stack tr {
+          display: block;
+          border: 1px solid #dee2e6;
+          margin-bottom: 12px;
+          padding: 10px;
+          background: #fff;
+          border-radius: 8px;
+        }
+        .table-responsive-stack td {
+          display: flex;
+          justify-content: space-between;
+          padding: 6px 0;
+          border: none;
+        }
+        .table-responsive-stack td::before {
+          content: attr(data-label);
+          font-weight: 600;
+        }
+      }
+    </style>
+  </head>
+
+  <body>
+    <div class="container py-4" id="adminApp">
+      <h2 class="fw-bold mb-2">Dynamic QR Code Manager</h2>
+      <p class="text-muted">
+        Local-only QR manager with editable destinations and scan analytics.
+        QR links include a fallback destination so they can redirect on new
+        devices.
+      </p>
+      <div class="alert alert-info py-2">
+        Admin page:
+        <a id="adminLink" class="mono" href="#" target="_blank" rel="noopener"
+          >/</a
+        >
+        <span class="mx-2">|</span>
+        QR redirect endpoint:
+        <a id="qrLink" class="mono" href="#" target="_blank" rel="noopener"
+          >/qr-page</a
+        >
+      </div>
+
+      <div class="row g-2 mb-3">
+        <div class="col-md-4">
+          <input
+            id="searchInput"
+            class="form-control"
+            placeholder="Search campaign..."
+          />
+        </div>
+        <div class="col-md-3">
+          <select id="statusFilter" class="form-select">
+            <option value="all">All</option>
+            <option value="active">Active</option>
+            <option value="paused">Paused</option>
+          </select>
+        </div>
+        <div class="col-md-3">
+          <button class="btn btn-outline-success w-100" id="exportBtn">
+            Export CSV
+          </button>
+        </div>
+        <div class="col-md-2">
+          <div class="border rounded p-2 bg-white text-center">
+            <div class="small text-muted">Total scans</div>
+            <div class="fw-bold" id="totalScans">0</div>
+          </div>
+        </div>
+      </div>
+
+      <div class="card mb-4">
+        <div class="card-body">
+          <h5>Create Campaign</h5>
+          <div class="row g-2">
+            <div class="col-md-4">
+              <input
+                id="campaignName"
+                class="form-control"
+                placeholder="Campaign name"
+              />
+            </div>
+            <div class="col-md-6">
+              <input
+                id="destinationUrl"
+                class="form-control"
+                placeholder="Destination URL"
+              />
+            </div>
+            <div class="col-md-2 d-grid">
+              <button class="btn btn-primary" id="addBtn">Create</button>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <table class="table table-bordered align-middle table-responsive-stack">
+        <thead class="table-dark">
+          <tr>
+            <th>#</th>
+            <th>Campaign</th>
+            <th>Destination URL</th>
+            <th>QR Link</th>
+            <th>Scans</th>
+            <th>Last Scan</th>
+            <th>UTM</th>
+            <th>Status</th>
+            <th>Health</th>
+            <th>Trend</th>
+            <th>Actions</th>
+          </tr>
+        </thead>
+        <tbody id="campaignTable"></tbody>
+      </table>
+    </div>
+
+    <script>
+      (function () {
+        const KEY = "DYNAMIC_QR_DB";
+        const redirectParam = "cid";
+        const campaignTable = document.getElementById("campaignTable");
+        const campaignNameInput = document.getElementById("campaignName");
+        const destinationInput = document.getElementById("destinationUrl");
+        const addBtn = document.getElementById("addBtn");
+        const exportBtn = document.getElementById("exportBtn");
+        const searchInput = document.getElementById("searchInput");
+        const statusFilter = document.getElementById("statusFilter");
+        const totalScans = document.getElementById("totalScans");
+        const scanChannelName = "qr-scan-events";
+        const scanBroadcast = "BroadcastChannel" in window
+          ? new BroadcastChannel(scanChannelName)
+          : null;
+
+        function db() {
+          const raw = localStorage.getItem(KEY);
+          if (!raw) return [];
+          try {
+            const parsed = JSON.parse(raw);
+            return Array.isArray(parsed) ? parsed : [];
+          } catch (err) {
+            return [];
+          }
+        }
+
+        function save(data) {
+          localStorage.setItem(KEY, JSON.stringify(data));
+        }
+
+        function notifyScanUpdate() {
+          if (!scanBroadcast) return;
+          try {
+            scanBroadcast.postMessage({ type: "scan" });
+          } catch (err) {
+            // Ignore broadcast errors.
+          }
+        }
+
+
+        function escapeHtml(value) {
+          return String(value)
+            .replace(/&/g, "&amp;")
+            .replace(/</g, "&lt;")
+            .replace(/>/g, "&gt;")
+            .replace(/"/g, "&quot;")
+            .replace(/'/g, "&#39;");
+        }
+
+        function validUrl(value) {
+          try {
+            new URL(value);
+            return true;
+          } catch (err) {
+            return false;
+          }
+        }
+
+        const BASE_URL = "https://5opf7q7r.fwfmsites.com";
+        const QR_PATH = "/qr-page";
+
+        function buildQrUrl(id, destination) {
+          const pageUrl = new URL(BASE_URL + QR_PATH);
+          pageUrl.searchParams.set(redirectParam, id);
+          if (destination) {
+            pageUrl.searchParams.set("dest", destination);
+          }
+          return pageUrl.toString();
+        }
+
+        function getHealth(scans) {
+          if (scans > 50) return "Healthy";
+          if (scans > 10) return "Average";
+          return "Low";
+        }
+
+        function renderTable() {
+          const search = searchInput.value.trim().toLowerCase();
+          const filter = statusFilter.value;
+          const data = db();
+
+          const filtered = data.filter((c) => {
+            const matchesText =
+              c.name.toLowerCase().includes(search) ||
+              c.url.toLowerCase().includes(search);
+            const matchesStatus =
+              filter === "all" ||
+              (filter === "active" && c.active !== false) ||
+              (filter === "paused" && c.active === false);
+            return matchesText && matchesStatus;
+          });
+
+          campaignTable.innerHTML = "";
+          totalScans.textContent = data.reduce(
+            (sum, c) => sum + (c.scans || 0),
+            0
+          );
+
+          filtered.forEach((c, i) => {
+            const qrUrl = buildQrUrl(c.id, c.url);
+            const health = getHealth(c.scans || 0);
+            const trend = Array.isArray(c.trend) ? c.trend : [];
+            const lastUTM = c.lastUTM || {};
+
+            const trendHtml =
+              trend.length === 0
+                ? "-"
+                : trend
+                    .slice(-10)
+                    .map((v) => `<span style="height:${v}px"></span>`)
+                    .join("");
+
+            const row = document.createElement("tr");
+            row.innerHTML = `
+              <td data-label="#">${i + 1}</td>
+              <td data-label="Campaign">
+                <input class="form-control form-control-sm" data-name="${
+                  c.id
+                }" value="${escapeHtml(c.name)}" />
+              </td>
+              <td data-label="Destination URL">
+                <input class="form-control form-control-sm" data-url="${
+                  c.id
+                }" value="${escapeHtml(c.url)}" />
+              </td>
+              <td data-label="QR Link" class="small text-break">
+                <span class="mono">${escapeHtml(qrUrl)}</span>
+              </td>
+              <td data-label="Scans">
+                <span class="badge bg-primary">${c.scans || 0}</span>
+              </td>
+              <td data-label="Last Scan" class="small text-muted">
+                ${c.lastScan ? escapeHtml(c.lastScan) : "-"}
+              </td>
+              <td data-label="UTM" class="small">
+                ${
+                  lastUTM.source || lastUTM.medium || lastUTM.campaign
+                    ? `src:${escapeHtml(lastUTM.source || "-")}<br />med:${escapeHtml(
+                        lastUTM.medium || "-"
+                      )}<br />camp:${escapeHtml(lastUTM.campaign || "-")}`
+                    : "-"
+                }
+              </td>
+              <td data-label="Status">
+                <select class="form-select form-select-sm" data-status="${
+                  c.id
+                }">
+                  <option value="active" ${
+                    c.active !== false ? "selected" : ""
+                  }>Active</option>
+                  <option value="paused" ${
+                    c.active === false ? "selected" : ""
+                  }>Paused</option>
+                </select>
+              </td>
+              <td data-label="Health">${health}</td>
+              <td data-label="Trend">
+                <div class="sparkline">${trendHtml}</div>
+              </td>
+              <td data-label="Actions">
+                <div class="d-flex gap-2">
+                  <button class="btn btn-sm btn-outline-primary" data-download="${
+                    c.id
+                  }">QR</button>
+                  <button class="btn btn-sm btn-outline-danger" data-remove="${
+                    c.id
+                  }">Delete</button>
+                </div>
+              </td>
+            `;
+            campaignTable.appendChild(row);
+          });
+        }
+
+        function setPageLinks() {
+          const adminUrl = BASE_URL + "/";
+          const qrUrl = BASE_URL + QR_PATH;
+          const adminLink = document.getElementById("adminLink");
+          const qrLink = document.getElementById("qrLink");
+          if (adminLink) {
+            adminLink.textContent = adminUrl;
+            adminLink.href = adminUrl;
+          }
+          if (qrLink) {
+            qrLink.textContent = qrUrl;
+            qrLink.href = qrUrl;
+          }
+        }
+
+        function updateName(id, value) {
+          const data = db();
+          const c = data.find((x) => x.id === id);
+          if (c) c.name = value.trim();
+          save(data);
+        }
+
+        function updateUrl(id, value) {
+          const data = db();
+          const c = data.find((x) => x.id === id);
+          if (c) c.url = value.trim();
+          save(data);
+        }
+
+        function toggleStatus(id, status) {
+          const data = db();
+          const c = data.find((x) => x.id === id);
+          if (c) c.active = status === "active";
+          save(data);
+        }
+
+        function removeCampaign(id) {
+          const data = db().filter((x) => x.id !== id);
+          save(data);
+          renderTable();
+        }
+
+        function downloadQR(url, name) {
+          const filename = `${name || "qr"}.png`;
+
+          if (window.QRCode && typeof QRCode.toDataURL === "function") {
+            QRCode.toDataURL(url, { width: 600 }, function (err, dataUrl) {
+              if (err || !dataUrl) {
+                downloadViaApi(url, filename);
+                return;
+              }
+              triggerDownload(dataUrl, filename);
+            });
+            return;
+          }
+
+          downloadViaApi(url, filename);
+        }
+
+        function downloadViaApi(url, filename) {
+          const apiUrl =
+            "https://api.qrserver.com/v1/create-qr-code/?size=600x600&data=" +
+            encodeURIComponent(url);
+          fetch(apiUrl)
+            .then((res) => res.blob())
+            .then((blob) => {
+              const objectUrl = URL.createObjectURL(blob);
+              triggerDownload(objectUrl, filename);
+              setTimeout(() => URL.revokeObjectURL(objectUrl), 1000);
+            })
+            .catch(() => {
+              window.open(apiUrl, "_blank");
+            });
+        }
+
+        function triggerDownload(href, filename) {
+          const a = document.createElement("a");
+          a.download = filename;
+          a.href = href;
+          document.body.appendChild(a);
+          a.click();
+          a.remove();
+        }
+
+        function exportCSV() {
+          const rows = [
+            [
+              "Campaign",
+              "URL",
+              "Status",
+              "Scans",
+              "Last Scan",
+              "UTM Source",
+              "UTM Medium",
+              "UTM Campaign",
+            ],
+          ];
+
+          db().forEach((c) => {
+            const utm = c.lastUTM || {};
+            rows.push([
+              c.name,
+              c.url,
+              c.active === false ? "Paused" : "Active",
+              c.scans || 0,
+              c.lastScan || "-",
+              utm.source || "-",
+              utm.medium || "-",
+              utm.campaign || "-",
+            ]);
+          });
+
+          const csv = rows.map((r) => r.map(escapeCsv).join(",")).join("\n");
+          const blob = new Blob([csv], { type: "text/csv" });
+          const a = document.createElement("a");
+          a.href = URL.createObjectURL(blob);
+          a.download = "qr_campaigns.csv";
+          a.click();
+        }
+
+        function escapeCsv(value) {
+          const s = String(value ?? "");
+          if (s.includes(",") || s.includes("\n") || s.includes('"')) {
+            return `"${s.replace(/"/g, '""')}"`;
+          }
+          return s;
+        }
+
+        function addCampaign() {
+          const name = campaignNameInput.value.trim();
+          const url = destinationInput.value.trim();
+          if (!name || !url) return alert("Fill all fields.");
+          if (!validUrl(url)) return alert("Please enter a valid URL.");
+
+          const data = db();
+          data.push({
+            id: String(Date.now()),
+            name,
+            url,
+            active: true,
+            scans: 0,
+            lastScan: null,
+            lastUTM: null,
+            trend: [],
+          });
+          save(data);
+          campaignNameInput.value = "";
+          destinationInput.value = "";
+          renderTable();
+        }
+
+        function redirectIfNeeded() {
+          return false;
+        }
+
+        if (scanBroadcast) {
+          scanBroadcast.addEventListener("message", function (event) {
+            if (event && event.data && event.data.type === "scan") {
+              renderTable();
+            }
+          });
+        }
+
+        window.addEventListener("storage", function (event) {
+          if (event.key === KEY) {
+            renderTable();
+          }
+        });
+
+        addBtn.addEventListener("click", addCampaign);
+        exportBtn.addEventListener("click", exportCSV);
+        searchInput.addEventListener("input", renderTable);
+        statusFilter.addEventListener("change", renderTable);
+
+        campaignTable.addEventListener("change", function (event) {
+          const target = event.target;
+          if (target.hasAttribute("data-name")) {
+            updateName(target.getAttribute("data-name"), target.value);
+          }
+          if (target.hasAttribute("data-url")) {
+            updateUrl(target.getAttribute("data-url"), target.value);
+          }
+          if (target.hasAttribute("data-status")) {
+            toggleStatus(target.getAttribute("data-status"), target.value);
+          }
+          renderTable();
+        });
+
+        campaignTable.addEventListener("click", function (event) {
+          const target = event.target;
+          if (target.hasAttribute("data-remove")) {
+            removeCampaign(target.getAttribute("data-remove"));
+          }
+          if (target.hasAttribute("data-download")) {
+            const id = target.getAttribute("data-download");
+            const data = db();
+            const c = data.find((x) => x.id === id);
+            if (!c) return;
+            downloadQR(buildQrUrl(c.id, c.url), c.name);
+          }
+        });
+
+        renderTable();
+        setPageLinks();
+      })();
+    </script>
+  </body>
+</html>
